@@ -13,9 +13,26 @@ from typing import Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
 Wall = Dict[str, object]
 LogFn = Callable[[str], None]
+Line = Tuple[float, float, float, float]
+Seg = Tuple[float, float, float, float, float]
 
 # Bump when editing this file; the log line proves which copy the editor loaded.
-DETECTOR_REVISION = "2026-09-02-opencv5-dedupe"
+DETECTOR_REVISION = "2026-09-03-junction-cleanup"
+
+# Raster (pixels)
+SNAP_ANGLE_DEG = 12.0
+COLLAPSE_TOL_PX = 3.0
+PAIR_MIN_GAP_PX = 4.0
+PAIR_MAX_GAP_PX = 80.0
+PAIR_MIN_OVERLAP_PX = 8.0
+MERGE_GAP_PX = 12.0
+MERGE_OFFSET_PX = 3.0
+
+# World-space cleanup (Unreal centimetres)
+JUNCTION_SNAP_CM = 12.0
+MIN_WALL_LENGTH_CM = 8.0
+MERGE_GAP_CM = 12.0
+MERGE_OFFSET_CM = 4.0
 
 
 def _log(message: str, log: Optional[LogFn]) -> None:
@@ -39,6 +56,10 @@ def _length(start: Sequence[float], end: Sequence[float]) -> float:
 
 def skip_zero_length(walls: Iterable[Wall], min_length: float = 1e-6) -> List[Wall]:
     return [w for w in walls if _length(w["start"], w["end"]) > min_length and w["thickness"] > min_length]
+
+
+def _is_horizontal(x1: float, y1: float, x2: float, y2: float) -> bool:
+    return abs(y2 - y1) < abs(x2 - x1)
 
 
 # ---------------------------------------------------------------------------
@@ -77,7 +98,12 @@ def detect_walls_from_image(
 
     _log("5. HoughLinesP, then horizontal/vertical snap.", log)
     raw = cv2.HoughLinesP(
-        edges, 1, np.pi / 180.0, threshold=80, minLineLength=max(24, min(width, height) // 40), maxLineGap=10
+        edges,
+        1,
+        np.pi / 180.0,
+        threshold=80,
+        minLineLength=max(24, min(width, height) // 40),
+        maxLineGap=10,
     )
     if raw is None:
         _log("ERROR: HoughLinesP returned no lines. Check contrast, scale, or DPI.", log)
@@ -85,9 +111,37 @@ def detect_walls_from_image(
 
     # OpenCV 4 returns (N, 1, 4); OpenCV 5 returns (N, 4).
     lines = np.asarray(raw, dtype=float).reshape(-1, 4)
+    snapped = _snap_axis_aligned(lines)
+    _log(f"   Hough produced {len(snapped)} snapped line(s).", log)
 
-    snapped: List[Tuple[float, float, float, float]] = []
-    angle_limit = math.radians(12.0)
+    _log("6. Collapse Canny duplicates, pair wall faces, merge colinear runs.", log)
+    collapsed = _collapse_duplicates(snapped, COLLAPSE_TOL_PX)
+    if pixels_per_foot <= 1e-6:
+        _log("ERROR: IMAGE_PIXELS_PER_FOOT must be > 0.", log)
+        return []
+    cm_per_pixel = 30.48 / pixels_per_foot
+    default_thickness_px = max(default_thickness_cm / cm_per_pixel, PAIR_MIN_GAP_PX)
+    paired = _pair_parallel_walls(collapsed, PAIR_MIN_GAP_PX, PAIR_MAX_GAP_PX, default_thickness_px)
+    merged = _merge_colinear(paired, MERGE_GAP_PX, MERGE_OFFSET_PX)
+
+    walls: List[Wall] = []
+    for x1, y1, x2, y2, thickness_px in merged:
+        # Image Y grows downward; Unreal XY uses Y up on the floor plane.
+        start = (x1 * cm_per_pixel, (height - y1) * cm_per_pixel)
+        end = (x2 * cm_per_pixel, (height - y2) * cm_per_pixel)
+        thickness = max(thickness_px * cm_per_pixel, default_thickness_cm * 0.25)
+        walls.append(_seg(start, end, thickness))
+
+    walls = cleanup_walls(walls)
+    _log(f"7. Raster route produced {len(walls)} wall segment(s).", log)
+    if not walls:
+        _log("ERROR: No usable walls after pairing/merge. Try a cleaner scan or different pixels-per-foot.", log)
+    return walls
+
+
+def _snap_axis_aligned(lines: Sequence[Sequence[float]]) -> List[Line]:
+    snapped: List[Line] = []
+    angle_limit = math.radians(SNAP_ANGLE_DEG)
     for x1, y1, x2, y2 in lines:
         dx, dy = x2 - x1, y2 - y1
         angle = abs(math.atan2(dy, dx))
@@ -98,167 +152,211 @@ def detect_walls_from_image(
             x = (x1 + x2) * 0.5
             snapped.append((x, min(y1, y2), x, max(y1, y2)))
         else:
-            snapped.append((x1, y1, x2, y2))
-
-    _log("6. Nearby parallel wall-pair filtering and merge.", log)
-    # Canny reports both sides of every drawn line, so collapse those duplicates
-    # first; otherwise wall pairing matches the artifact instead of the wall faces.
-    collapsed = _collapse_duplicates(snapped, tol=3.0)
-    paired = _pair_parallel_walls(collapsed, min_gap=4.0, max_gap=80.0)
-    merged = _merge_colinear(paired)
-
-    if pixels_per_foot <= 1e-6:
-        _log("ERROR: IMAGE_PIXELS_PER_FOOT must be > 0.", log)
-        return []
-
-    cm_per_pixel = 30.48 / pixels_per_foot
-    walls: List[Wall] = []
-    for x1, y1, x2, y2, thickness_px in merged:
-        # Image Y grows downward; Unreal XY uses Y up on the floor plane.
-        start = (x1 * cm_per_pixel, (height - y1) * cm_per_pixel)
-        end = (x2 * cm_per_pixel, (height - y2) * cm_per_pixel)
-        thickness = max(thickness_px * cm_per_pixel, default_thickness_cm * 0.25)
-        walls.append(_seg(start, end, thickness))
-
-    walls = skip_zero_length(walls)
-    _log(f"7. Raster route produced {len(walls)} wall segment(s).", log)
-    if not walls:
-        _log("ERROR: No usable walls after pairing/merge. Try a cleaner scan or different pixels-per-foot.", log)
-    return walls
+            snapped.append((float(x1), float(y1), float(x2), float(y2)))
+    return snapped
 
 
-def _collapse_duplicates(
-    lines: Sequence[Tuple[float, float, float, float]],
-    tol: float,
-) -> List[Tuple[float, float, float, float]]:
+def _collapse_duplicates(lines: Sequence[Line], tol: float) -> List[Line]:
     """Merge overlapping lines that sit within tol of the same axis offset."""
-    horizontals: List[Tuple[float, float, float, float]] = []
-    verticals: List[Tuple[float, float, float, float]] = []
-    for line in lines:
-        if abs(line[3] - line[1]) < abs(line[2] - line[0]):
-            horizontals.append(line)
-        else:
-            verticals.append(line)
+    horizontals = [line for line in lines if _is_horizontal(*line)]
+    verticals = [line for line in lines if not _is_horizontal(*line)]
+    return _collapse_group(horizontals, True, tol) + _collapse_group(verticals, False, tol)
 
-    def collapse(group, is_horizontal: bool):
-        result: List[Tuple[float, float, float, float]] = []
-        for line in group:
-            for index, existing in enumerate(result):
-                if is_horizontal:
-                    same_offset = abs(line[1] - existing[1]) <= tol
-                    overlaps = min(line[2], existing[2]) >= max(line[0], existing[0]) - tol
-                    if same_offset and overlaps:
-                        offset = (line[1] + existing[1]) * 0.5
-                        result[index] = (
-                            min(line[0], existing[0]), offset,
-                            max(line[2], existing[2]), offset,
-                        )
-                        break
-                else:
-                    same_offset = abs(line[0] - existing[0]) <= tol
-                    overlaps = min(line[3], existing[3]) >= max(line[1], existing[1]) - tol
-                    if same_offset and overlaps:
-                        offset = (line[0] + existing[0]) * 0.5
-                        result[index] = (
-                            offset, min(line[1], existing[1]),
-                            offset, max(line[3], existing[3]),
-                        )
-                        break
+
+def _collapse_group(group: Sequence[Line], is_horizontal: bool, tol: float) -> List[Line]:
+    if not group:
+        return []
+    ordered = sorted(group, key=lambda line: (line[1], line[0]) if is_horizontal else (line[0], line[1]))
+    result: List[Line] = []
+    for line in ordered:
+        merged = False
+        # Nearby offsets live at the end of the sorted result.
+        for index in range(len(result) - 1, -1, -1):
+            existing = result[index]
+            if is_horizontal:
+                if existing[1] < line[1] - tol:
+                    break
+                overlaps = min(line[2], existing[2]) >= max(line[0], existing[0]) - tol
+                if overlaps:
+                    offset = (line[1] + existing[1]) * 0.5
+                    result[index] = (min(line[0], existing[0]), offset, max(line[2], existing[2]), offset)
+                    merged = True
+                    break
             else:
-                result.append(line)
-        return result
-
-    return collapse(horizontals, True) + collapse(verticals, False)
+                if existing[0] < line[0] - tol:
+                    break
+                overlaps = min(line[3], existing[3]) >= max(line[1], existing[1]) - tol
+                if overlaps:
+                    offset = (line[0] + existing[0]) * 0.5
+                    result[index] = (offset, min(line[1], existing[1]), offset, max(line[3], existing[3]))
+                    merged = True
+                    break
+        if not merged:
+            result.append(line)
+    return result
 
 
 def _pair_parallel_walls(
-    lines: Sequence[Tuple[float, float, float, float]],
+    lines: Sequence[Line],
     min_gap: float,
     max_gap: float,
-) -> List[Tuple[float, float, float, float, float]]:
-    used = [False] * len(lines)
-    result: List[Tuple[float, float, float, float, float]] = []
+    unpaired_thickness: float,
+) -> List[Seg]:
+    horizontals = [line for line in lines if _is_horizontal(*line)]
+    verticals = [line for line in lines if not _is_horizontal(*line)]
+    return _pair_group(horizontals, True, min_gap, max_gap, unpaired_thickness) + _pair_group(
+        verticals, False, min_gap, max_gap, unpaired_thickness
+    )
 
-    def is_horizontal(line: Tuple[float, float, float, float]) -> bool:
-        return abs(line[3] - line[1]) < abs(line[2] - line[0])
 
-    for i, a in enumerate(lines):
+def _pair_group(
+    group: Sequence[Line],
+    is_horizontal: bool,
+    min_gap: float,
+    max_gap: float,
+    unpaired_thickness: float,
+) -> List[Seg]:
+    if not group:
+        return []
+    ordered = sorted(group, key=lambda line: (line[1], line[0]) if is_horizontal else (line[0], line[1]))
+    used = [False] * len(ordered)
+    result: List[Seg] = []
+
+    def offset(line: Line) -> float:
+        return (line[1] + line[3]) * 0.5 if is_horizontal else (line[0] + line[2]) * 0.5
+
+    def overlap(a: Line, b: Line) -> float:
+        if is_horizontal:
+            return min(a[2], b[2]) - max(a[0], b[0])
+        return min(a[3], b[3]) - max(a[1], b[1])
+
+    for i, a in enumerate(ordered):
         if used[i]:
             continue
         best_j = -1
         best_gap = max_gap + 1.0
-        a_h = is_horizontal(a)
-        for j, b in enumerate(lines):
-            if i == j or used[j] or is_horizontal(b) != a_h:
+        a_off = offset(a)
+        for j in range(i + 1, len(ordered)):
+            if used[j]:
                 continue
-            if a_h:
-                overlap = min(a[2], b[2]) - max(a[0], b[0])
-                if overlap < 8.0:
-                    continue
-                gap = abs((a[1] + a[3]) * 0.5 - (b[1] + b[3]) * 0.5)
-            else:
-                overlap = min(a[3], b[3]) - max(a[1], b[1])
-                if overlap < 8.0:
-                    continue
-                gap = abs((a[0] + a[2]) * 0.5 - (b[0] + b[2]) * 0.5)
-            if min_gap <= gap <= max_gap and gap < best_gap:
+            gap = offset(ordered[j]) - a_off
+            if gap < min_gap:
+                continue
+            if gap > max_gap:
+                break
+            if overlap(a, ordered[j]) < PAIR_MIN_OVERLAP_PX:
+                continue
+            if gap < best_gap:
                 best_gap = gap
                 best_j = j
 
+        used[i] = True
         if best_j >= 0:
-            used[i] = used[best_j] = True
-            b = lines[best_j]
-            if a_h:
-                y = ((a[1] + a[3]) + (b[1] + b[3])) * 0.25
-                x1, x2 = min(a[0], b[0]), max(a[2], b[2])
-                result.append((x1, y, x2, y, best_gap))
+            used[best_j] = True
+            b = ordered[best_j]
+            if is_horizontal:
+                y = (a_off + offset(b)) * 0.5
+                result.append((min(a[0], b[0]), y, max(a[2], b[2]), y, best_gap))
             else:
-                x = ((a[0] + a[2]) + (b[0] + b[2])) * 0.25
-                y1, y2 = min(a[1], b[1]), max(a[3], b[3])
-                result.append((x, y1, x, y2, best_gap))
+                x = (a_off + offset(b)) * 0.5
+                result.append((x, min(a[1], b[1]), x, max(a[3], b[3]), best_gap))
         else:
-            used[i] = True
-            result.append((a[0], a[1], a[2], a[3], 12.0))
-
+            result.append((a[0], a[1], a[2], a[3], unpaired_thickness))
     return result
 
 
-def _merge_colinear(
-    segs: Sequence[Tuple[float, float, float, float, float]],
-    gap: float = 12.0,
-) -> List[Tuple[float, float, float, float, float]]:
-    horizontals = [s for s in segs if abs(s[3] - s[1]) < abs(s[2] - s[0])]
-    verticals = [s for s in segs if s not in horizontals]
-    merged: List[Tuple[float, float, float, float, float]] = []
+def _merge_colinear(segs: Sequence[Seg], gap: float, offset_tol: float) -> List[Seg]:
+    horizontals = [seg for seg in segs if _is_horizontal(seg[0], seg[1], seg[2], seg[3])]
+    verticals = [seg for seg in segs if not _is_horizontal(seg[0], seg[1], seg[2], seg[3])]
+    return _merge_group(horizontals, True, gap, offset_tol) + _merge_group(verticals, False, gap, offset_tol)
 
-    horizontals.sort(key=lambda s: (round(s[1], 1), s[0]))
-    group: List[Tuple[float, float, float, float, float]] = []
-    for seg in horizontals:
-        if not group:
-            group = [seg]
-            continue
-        prev = group[-1]
-        if abs(seg[1] - prev[1]) < 3.0 and seg[0] <= prev[2] + gap:
-            group[-1] = (prev[0], prev[1], max(prev[2], seg[2]), prev[3], max(prev[4], seg[4]))
-        else:
-            merged.extend(group)
-            group = [seg]
-    merged.extend(group)
 
-    verticals.sort(key=lambda s: (round(s[0], 1), s[1]))
-    group = []
-    for seg in verticals:
-        if not group:
-            group = [seg]
-            continue
-        prev = group[-1]
-        if abs(seg[0] - prev[0]) < 3.0 and seg[1] <= prev[3] + gap:
-            group[-1] = (prev[0], prev[1], prev[2], max(prev[3], seg[3]), max(prev[4], seg[4]))
+def _merge_group(segs: Sequence[Seg], is_horizontal: bool, gap: float, offset_tol: float) -> List[Seg]:
+    if not segs:
+        return []
+    ordered = sorted(segs, key=lambda seg: (seg[1], seg[0]) if is_horizontal else (seg[0], seg[1]))
+    merged: List[Seg] = [ordered[0]]
+    for seg in ordered[1:]:
+        prev = merged[-1]
+        if is_horizontal:
+            same_run = abs(seg[1] - prev[1]) < offset_tol and seg[0] <= prev[2] + gap
+            if same_run:
+                merged[-1] = (prev[0], prev[1], max(prev[2], seg[2]), prev[3], max(prev[4], seg[4]))
+                continue
         else:
-            merged.extend(group)
-            group = [seg]
-    merged.extend(group)
+            same_run = abs(seg[0] - prev[0]) < offset_tol and seg[1] <= prev[3] + gap
+            if same_run:
+                merged[-1] = (prev[0], prev[1], prev[2], max(prev[3], seg[3]), max(prev[4], seg[4]))
+                continue
+        merged.append(seg)
     return merged
+
+
+# ---------------------------------------------------------------------------
+# World-space cleanup (all input formats)
+# ---------------------------------------------------------------------------
+
+def cleanup_walls(
+    walls: Sequence[Wall],
+    snap_cm: float = JUNCTION_SNAP_CM,
+    min_length_cm: float = MIN_WALL_LENGTH_CM,
+) -> List[Wall]:
+    """Snap T-junctions and corners, merge colinear runs, drop noise."""
+    segs: List[Seg] = []
+    for wall in walls:
+        start, end = wall["start"], wall["end"]
+        x1, y1, x2, y2 = float(start[0]), float(start[1]), float(end[0]), float(end[1])
+        if _is_horizontal(x1, y1, x2, y2):
+            y = (y1 + y2) * 0.5
+            segs.append((min(x1, x2), y, max(x1, x2), y, float(wall["thickness"])))
+        elif abs(x2 - x1) < abs(y2 - y1):
+            x = (x1 + x2) * 0.5
+            segs.append((x, min(y1, y2), x, max(y1, y2), float(wall["thickness"])))
+        else:
+            segs.append((x1, y1, x2, y2, float(wall["thickness"])))
+
+    segs = _snap_junctions(segs, snap_cm)
+    segs = _merge_colinear(segs, MERGE_GAP_CM, MERGE_OFFSET_CM)
+
+    cleaned: List[Wall] = []
+    for x1, y1, x2, y2, thickness in segs:
+        if math.hypot(x2 - x1, y2 - y1) < min_length_cm or thickness <= 1e-6:
+            continue
+        cleaned.append(_seg((x1, y1), (x2, y2), thickness))
+    return cleaned
+
+
+def _snap_junctions(segs: Sequence[Seg], snap_cm: float) -> List[Seg]:
+    """Pull nearby axis-aligned endpoints onto H/V intersections."""
+    mutable = [list(seg) for seg in segs]
+    horizontals = [
+        item for item in mutable if abs(item[3] - item[1]) < abs(item[2] - item[0])
+    ]
+    verticals = [
+        item for item in mutable if abs(item[3] - item[1]) >= abs(item[2] - item[0])
+    ]
+
+    for horizontal in horizontals:
+        iy = (horizontal[1] + horizontal[3]) * 0.5
+        for vertical in verticals:
+            ix = (vertical[0] + vertical[2]) * 0.5
+            extra = snap_cm + max(horizontal[4], vertical[4]) * 0.5
+            if not (horizontal[0] - extra <= ix <= horizontal[2] + extra):
+                continue
+            if not (vertical[1] - extra <= iy <= vertical[3] + extra):
+                continue
+            if abs(horizontal[0] - ix) <= extra:
+                horizontal[0] = ix
+            if abs(horizontal[2] - ix) <= extra:
+                horizontal[2] = ix
+            if abs(vertical[1] - iy) <= extra:
+                vertical[1] = iy
+            if abs(vertical[3] - iy) <= extra:
+                vertical[3] = iy
+            horizontal[1] = horizontal[3] = iy
+            vertical[0] = vertical[2] = ix
+
+    return [tuple(item) for item in mutable]  # type: ignore[misc]
 
 
 # ---------------------------------------------------------------------------
@@ -292,7 +390,6 @@ def detect_walls_from_pdf(
     for drawing in drawings:
         stroke = drawing.get("width") or 1.0
         thickness = max(float(stroke) * pdf_points_to_unreal_cm, default_thickness_cm * 0.2)
-        color = drawing.get("color")
         # Skip large filled rooms; keep stroked linework.
         if drawing.get("fill") and not drawing.get("color") and stroke <= 0.0:
             continue
@@ -310,9 +407,7 @@ def detect_walls_from_pdf(
             elif kind == "re":
                 rect = item[1]
                 x0, y0, x1, y1 = rect.x0, rect.y0, rect.x1, rect.y1
-                corners = [
-                    (x0, y0), (x1, y0), (x1, y1), (x0, y1), (x0, y0)
-                ]
+                corners = [(x0, y0), (x1, y0), (x1, y1), (x0, y1), (x0, y0)]
                 for a, b in zip(corners, corners[1:]):
                     vector_walls.append(
                         _seg(
@@ -333,7 +428,7 @@ def detect_walls_from_pdf(
                         )
                     )
 
-    vector_walls = skip_zero_length(vector_walls, min_length=pdf_points_to_unreal_cm * 2.0)
+    vector_walls = cleanup_walls(vector_walls, min_length_cm=max(MIN_WALL_LENGTH_CM, pdf_points_to_unreal_cm * 2.0))
     if vector_walls:
         _log(f"5. Vector PDF produced {len(vector_walls)} wall segment(s).", log)
         document.close()
@@ -442,11 +537,9 @@ def detect_walls_from_dxf(
     walls: List[Wall] = []
     for layer_name in selected_layers:
         for entity in entities_by_layer[layer_name]:
-            walls.extend(
-                _entity_to_walls(entity, dxf_units_to_unreal_cm, default_thickness_cm)
-            )
+            walls.extend(_entity_to_walls(entity, dxf_units_to_unreal_cm, default_thickness_cm))
 
-    walls = skip_zero_length(walls)
+    walls = cleanup_walls(walls)
     _log(f"6. CAD route produced {len(walls)} wall segment(s) from layers {selected_layers}.", log)
     if not walls:
         _log(
@@ -465,16 +558,12 @@ def _select_cad_layers(
     names = list(layer_counts.keys())
     requested = (layer_filter or "").strip()
     if requested:
-        exact = [name for name in names if name == requested]
-        if exact:
-            return exact
-        insensitive = [name for name in names if name.lower() == requested.lower()]
-        if insensitive:
-            _log(
-                f"   Layer filter '{requested}' matched '{insensitive[0]}' case-insensitively.",
-                log,
-            )
-            return insensitive
+        wanted = {part.strip().lower() for part in requested.split(",") if part.strip()}
+        matched = [name for name in names if name.lower() in wanted]
+        if matched:
+            if any(name.lower() != requested.lower() for name in matched) or "," in requested:
+                _log(f"   Layer filter '{requested}' matched {matched}.", log)
+            return matched
         _log(
             f"WARNING: Layer filter '{requested}' matched no layer. Falling back to auto-detect.",
             log,
@@ -544,7 +633,7 @@ def detect_walls_from_path(
         )
     if suffix == ".dxf":
         _log("2. Routing DXF through ezdxf.", log)
-        return detect_walls_from_dxf(file_path, dxf_units_to_unreal_cm, cad_layer_filter, log, default_thickness_cm)
+        return detect_walls_from_dxf(dxf_path=file_path, dxf_units_to_unreal_cm=dxf_units_to_unreal_cm, layer_filter=cad_layer_filter, log=log, default_thickness_cm=default_thickness_cm)
     if suffix == ".dwg":
         _log("2. Routing DWG through ODA File Converter, then ezdxf.", log)
         oda = find_oda_converter(oda_converter_path)

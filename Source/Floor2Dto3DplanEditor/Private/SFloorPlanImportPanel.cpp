@@ -116,7 +116,7 @@ namespace FloorPlanImportPanel
 void SFloorPlanImportPanel::Construct(const FArguments& InArgs)
 {
 	LoadSettings();
-	StatusText = LOCTEXT("StatusIdle", "Select a floor plan, then press Generate Walls.");
+	StatusText = LOCTEXT("StatusIdle", "Select a floor plan, then press Detect Editable Walls.");
 
 	ChildSlot
 	[
@@ -152,7 +152,7 @@ void SFloorPlanImportPanel::Construct(const FArguments& InArgs)
 	];
 
 	AppendLog(
-		TEXT("Panel ready. Final output is a Blueprint containing a saved Static Mesh; no Blender, FBX, or GLB is involved."),
+		TEXT("Panel ready. Detection creates one independently selectable wall actor per segment in FloorPlan_Walls."),
 		EFloorPlanLogSeverity::Info);
 }
 
@@ -365,8 +365,8 @@ TSharedRef<SWidget> SFloorPlanImportPanel::BuildActionSection()
 			.AutoWidth()
 			[
 				SNew(SButton)
-				.Text(LOCTEXT("Generate", "Generate Walls"))
-				.ToolTipText(LOCTEXT("GenerateTooltip", "Detect walls, create a Static Mesh asset, and place a reusable Blueprint actor."))
+				.Text(LOCTEXT("Generate", "Detect Editable Walls"))
+				.ToolTipText(LOCTEXT("GenerateTooltip", "Detect walls and create one selectable BP_WallSegment/native wall actor per result."))
 				.IsEnabled_Lambda([this]() { return CanGenerate(); })
 				.OnClicked(this, &SFloorPlanImportPanel::OnGenerateClicked)
 			]
@@ -476,7 +476,7 @@ FReply SFloorPlanImportPanel::OnBrowseClicked()
 		FloorPlanPath = FPaths::ConvertRelativePathToFull(OpenedFiles[0]);
 		SaveSettings();
 		AppendLog(FString::Printf(TEXT("Selected %s"), *FloorPlanPath), EFloorPlanLogSeverity::Info);
-		StatusText = LOCTEXT("StatusReady", "Ready. Press Generate Walls.");
+		StatusText = LOCTEXT("StatusReady", "Ready. Press Detect Editable Walls.");
 	}
 
 	return FReply::Handled();
@@ -614,7 +614,7 @@ void SFloorPlanImportPanel::RunImport()
 
 	AppendLog(TEXT("----------------------------------------"), EFloorPlanLogSeverity::Info);
 	AppendLog(
-		FString::Printf(TEXT("Generating walls from %s"), *FloorPlanPath),
+		FString::Printf(TEXT("Detecting editable walls from %s"), *FloorPlanPath),
 		EFloorPlanLogSeverity::Info);
 
 	FPythonCommandEx PythonCommand;
@@ -625,7 +625,7 @@ void SFloorPlanImportPanel::RunImport()
 
 	bool bCommandSucceeded = false;
 	{
-		FScopedSlowTask SlowTask(1.0f, LOCTEXT("Detecting", "Detecting walls and building meshes..."));
+		FScopedSlowTask SlowTask(1.0f, LOCTEXT("Detecting", "Detecting and spawning editable wall actors..."));
 		SlowTask.MakeDialog();
 		SlowTask.EnterProgressFrame(1.0f);
 
@@ -648,10 +648,10 @@ void SFloorPlanImportPanel::RunImport()
 	if (WallCount > 0)
 	{
 		AppendLog(
-			FString::Printf(TEXT("Done. Generated %d wall segment(s)."), WallCount),
+			FString::Printf(TEXT("Done. Spawned %d editable wall actor(s)."), WallCount),
 			EFloorPlanLogSeverity::Success);
 		StatusText = FText::Format(
-			LOCTEXT("StatusSuccess", "Generated {0} wall segment(s) as a Blueprint with a Static Mesh."),
+			LOCTEXT("StatusSuccess", "Spawned {0} editable wall actor(s) in FloorPlan_Walls."),
 			FText::AsNumber(WallCount));
 	}
 	else if (WallCount == 0)

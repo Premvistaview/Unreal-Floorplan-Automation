@@ -50,12 +50,13 @@ namespace
 			Mesh.AppendTriangle(VertexIDs[A], VertexIDs[B], VertexIDs[C]);
 		};
 
-		AddTriangle(0, 2, 1); AddTriangle(0, 3, 2);
-		AddTriangle(4, 5, 6); AddTriangle(4, 6, 7);
-		AddTriangle(0, 1, 5); AddTriangle(0, 5, 4);
-		AddTriangle(1, 2, 6); AddTriangle(1, 6, 5);
-		AddTriangle(2, 3, 7); AddTriangle(2, 7, 6);
-		AddTriangle(3, 0, 4); AddTriangle(3, 4, 7);
+		// Wound so the faces point inward, for viewing the plan from inside the rooms.
+		AddTriangle(0, 1, 2); AddTriangle(0, 2, 3);
+		AddTriangle(4, 6, 5); AddTriangle(4, 7, 6);
+		AddTriangle(0, 5, 1); AddTriangle(0, 4, 5);
+		AddTriangle(1, 6, 2); AddTriangle(1, 5, 6);
+		AddTriangle(2, 7, 3); AddTriangle(2, 6, 7);
+		AddTriangle(3, 4, 0); AddTriangle(3, 7, 4);
 		return true;
 	}
 }

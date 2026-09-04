@@ -1,4 +1,4 @@
-"""Headless end-to-end test of the Floor Plan Import panel's Python bridge.
+"""Headless end-to-end test of editable per-wall import and JSON export.
 
 Run with:
     UnrealEditor-Cmd.exe <uproject> -run=pythonscript
@@ -33,11 +33,6 @@ def build_synthetic_plan() -> str:
 def run() -> None:
     plan_path = build_synthetic_plan()
     unreal.log(f"Synthetic plan written to {plan_path}")
-    output_folder = "/Game/Generated/FloorPlanTests"
-    assets_before = set(
-        unreal.EditorAssetLibrary.list_assets(output_folder, recursive=True)
-    )
-
     payload = json.dumps({
         "file_path": plan_path,
         "pixels_per_foot": 10.0,
@@ -50,7 +45,6 @@ def run() -> None:
         "oda_converter_path": "",
         "generate_collision": True,
         "show_dialogs": False,
-        "output_folder": output_folder,
     }, separators=(",", ":"))
 
     result = floorplan_panel.run_from_json(payload)
@@ -60,48 +54,46 @@ def run() -> None:
         raise RuntimeError(f"Expected {EXPECTED_WALLS} walls, got {result!r}")
 
     subsystem = unreal.get_editor_subsystem(unreal.EditorActorSubsystem)
-    intermediate_actors = [
+    combined_actors = [
         actor for actor in subsystem.get_all_level_actors()
         if isinstance(actor, unreal.WallGeneratorActor)
     ]
-    if intermediate_actors:
-        raise RuntimeError("The intermediate WallGeneratorActor was not removed.")
+    if combined_actors:
+        raise RuntimeError("Legacy combined WallGeneratorActor should not be created.")
 
-    assets_after = set(
-        unreal.EditorAssetLibrary.list_assets(output_folder, recursive=True)
+    import unreal_floorplan_router as router
+    editable = router.get_editable_wall_actors()
+    if len(editable) != EXPECTED_WALLS:
+        raise RuntimeError(f"Expected {EXPECTED_WALLS} editable actors, got {len(editable)}.")
+    if not all(isinstance(actor, unreal.WallSegmentActor) for actor in editable):
+        raise RuntimeError("At least one generated actor is not a WallSegmentActor/BP child.")
+    if not all(
+        any(str(tag) == router.WALL_TAG for tag in actor.get_editor_property("tags"))
+        for actor in editable
+    ):
+        raise RuntimeError("At least one generated actor is missing the editable-wall tag.")
+
+    first = editable[0]
+    local_start = first.get_editor_property("start")
+    first.set_actor_location(unreal.Vector(25.0, 10.0, 0.0), False, False)
+    first.set_actor_rotation(unreal.Rotator(0.0, 0.0, 30.0), False)
+    first.set_actor_scale3d(unreal.Vector(1.5, 2.0, 1.0))
+    expected_start = first.get_actor_transform().transform_location(
+        unreal.Vector(float(local_start.x), float(local_start.y), 0.0)
     )
-    new_assets = assets_after - assets_before
-    blueprint_assets = [
-        path for path in new_assets
-        if "/BP_" in path and not path.endswith("_C")
-    ]
-    static_mesh_assets = [path for path in new_assets if "/SM_" in path]
-    if len(blueprint_assets) != 1 or len(static_mesh_assets) != 1:
-        raise RuntimeError(
-            "Expected one new Blueprint and one new Static Mesh; "
-            f"created assets were {sorted(new_assets)}"
-        )
-
-    matching_instances = []
-    for actor in subsystem.get_all_level_actors():
-        mesh_component = actor.get_component_by_class(unreal.StaticMeshComponent)
-        if not mesh_component:
-            continue
-        static_mesh = mesh_component.get_editor_property("static_mesh")
-        if static_mesh and static_mesh.get_path_name().startswith(
-            static_mesh_assets[0].split(".")[0]
-        ):
-            matching_instances.append(actor)
-
-    if len(matching_instances) != 1:
-        raise RuntimeError(
-            "Expected one placed Blueprint instance using the generated Static Mesh, "
-            f"got {len(matching_instances)}."
-        )
+    export_path = str(Path(tempfile.gettempdir()) / "floorplan_corrected_walls.json")
+    written_path = router.export_corrected_walls(export_path)
+    records = json.loads(Path(written_path).read_text(encoding="utf-8"))
+    if len(records) != EXPECTED_WALLS:
+        raise RuntimeError(f"Expected {EXPECTED_WALLS} exported records, got {len(records)}.")
+    if records[0]["start"] != [
+        round(float(expected_start.x), 4),
+        round(float(expected_start.y), 4),
+    ]:
+        raise RuntimeError("Export did not apply the wall actor's translation, rotation, and scale.")
 
     unreal.log(
-        "PASS: final output is Blueprint "
-        f"{blueprint_assets[0]} with Static Mesh {static_mesh_assets[0]}."
+        f"PASS: spawned {len(editable)} independent walls and exported corrected transforms to {written_path}."
     )
 
 

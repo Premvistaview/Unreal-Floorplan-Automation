@@ -45,4 +45,16 @@ for wall in walls:
 
 if len(walls) != 4:
     raise SystemExit(f"FAIL: expected 4 walls, got {len(walls)}")
+
+# Next-stage cleanup: a T-junction with a small gap should snap shut.
+gapped = [
+    {"start": [0.0, 100.0], "end": [100.0, 100.0], "thickness": 15.0},
+    {"start": [50.0, 0.0], "end": [50.0, 92.0], "thickness": 15.0},
+]
+cleaned = fd.cleanup_walls(gapped)
+vertical = next(w for w in cleaned if abs(w["start"][0] - w["end"][0]) < 1.0)
+top = max(vertical["start"][1], vertical["end"][1])
+if abs(top - 100.0) > 0.01:
+    raise SystemExit(f"FAIL: T-junction did not snap (top={top})")
+
 print("PASS")

@@ -60,3 +60,27 @@ def run_from_json(payload: str) -> int:
         for line in traceback.format_exc().splitlines():
             unreal.log_error(line)
         return -1
+
+
+def add_wall() -> int:
+    """Editor Utility Widget / Python console entry point for Add Wall."""
+    try:
+        router = _reload_pipeline()
+        return 1 if router.add_wall() else 0
+    except Exception as exc:
+        unreal.log_error(f"Add Wall failed: {exc}")
+        for line in traceback.format_exc().splitlines():
+            unreal.log_error(line)
+        return -1
+
+
+def export_corrected_walls(output_path: str = "") -> str:
+    """Editor Utility Widget / Python console entry point for JSON export."""
+    try:
+        router = _reload_pipeline()
+        return str(router.export_corrected_walls(output_path))
+    except Exception as exc:
+        unreal.log_error(f"Export corrected walls failed: {exc}")
+        for line in traceback.format_exc().splitlines():
+            unreal.log_error(line)
+        return ""
