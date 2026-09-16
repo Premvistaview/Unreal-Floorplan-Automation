@@ -55,13 +55,19 @@ private:
 	FReply OnBrowseClicked();
 	FReply OnBrowseOdaClicked();
 	FReply OnGenerateClicked();
+	FReply OnAddWallClicked();
+	FReply OnExportClicked();
 	FReply OnClearLogClicked();
 	FReply OnCopyLogClicked();
 
 	bool CanGenerate() const;
+	bool CanRunCorrectionTools() const;
 
 	/** Appends text to the log, splitting embedded newlines into separate rows. */
 	void AppendLog(const FString& Text, EFloorPlanLogSeverity Severity);
+
+	/** Runs a Python statement, mirrors captured output into the panel log, and returns the result text. */
+	bool ExecPython(const FString& Command, const FText& SlowTaskText, FString& OutResult);
 
 	/** Runs the Python bridge and mirrors its captured output into the log. */
 	void RunImport();

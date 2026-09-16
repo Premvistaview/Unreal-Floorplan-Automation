@@ -66,7 +66,8 @@ names. The native-backed version is recommended and tested by the project.
 ## Correcting walls in the viewport
 
 Run **Tools > Floor Plan > Floor Plan Import**, choose the source, and press
-**Detect Editable Walls**.
+**Detect Editable Walls**. The same panel also has **Add Wall** and
+**Export walls.json**, so a separate Editor Utility Widget is optional.
 
 Each result is a standard independently selectable actor:
 

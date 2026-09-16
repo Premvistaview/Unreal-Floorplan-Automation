@@ -371,6 +371,26 @@ TSharedRef<SWidget> SFloorPlanImportPanel::BuildActionSection()
 				.OnClicked(this, &SFloorPlanImportPanel::OnGenerateClicked)
 			]
 			+ SHorizontalBox::Slot()
+			.AutoWidth()
+			.Padding(8.0f, 0.0f, 0.0f, 0.0f)
+			[
+				SNew(SButton)
+				.Text(LOCTEXT("AddWall", "Add Wall"))
+				.ToolTipText(LOCTEXT("AddWallTooltip", "Spawn a short new wall at the viewport focus and parent it under FloorPlan_Walls."))
+				.IsEnabled_Lambda([this]() { return CanRunCorrectionTools(); })
+				.OnClicked(this, &SFloorPlanImportPanel::OnAddWallClicked)
+			]
+			+ SHorizontalBox::Slot()
+			.AutoWidth()
+			.Padding(8.0f, 0.0f, 0.0f, 0.0f)
+			[
+				SNew(SButton)
+				.Text(LOCTEXT("ExportWalls", "Export walls.json"))
+				.ToolTipText(LOCTEXT("ExportWallsTooltip", "Write the current FloorPlan_Walls actors, including viewport transforms, to Saved/FloorPlan/walls.json."))
+				.IsEnabled_Lambda([this]() { return CanRunCorrectionTools(); })
+				.OnClicked(this, &SFloorPlanImportPanel::OnExportClicked)
+			]
+			+ SHorizontalBox::Slot()
 			.FillWidth(1.0f)
 			.VAlign(VAlign_Center)
 			.Padding(12.0f, 0.0f, 0.0f, 0.0f)
@@ -448,6 +468,11 @@ bool SFloorPlanImportPanel::CanGenerate() const
 	return !bIsRunning && !FloorPlanPath.IsEmpty();
 }
 
+bool SFloorPlanImportPanel::CanRunCorrectionTools() const
+{
+	return !bIsRunning;
+}
+
 FReply SFloorPlanImportPanel::OnBrowseClicked()
 {
 	IDesktopPlatform* DesktopPlatform = FDesktopPlatformModule::Get();
@@ -513,6 +538,62 @@ FReply SFloorPlanImportPanel::OnGenerateClicked()
 {
 	SaveSettings();
 	RunImport();
+	return FReply::Handled();
+}
+
+FReply SFloorPlanImportPanel::OnAddWallClicked()
+{
+	SaveSettings();
+
+	const FString Command = FString::Printf(
+		TEXT("__import__('floorplan_panel').add_wall(200.0, %f, %f, %s)"),
+		DefaultThicknessCm,
+		WallHeightCm,
+		bGenerateCollision ? TEXT("True") : TEXT("False"));
+
+	FString Result;
+	if (!ExecPython(Command, LOCTEXT("AddingWall", "Adding a wall actor..."), Result))
+	{
+		return FReply::Handled();
+	}
+
+	const int32 Added = FCString::Atoi(*Result);
+	if (Added > 0)
+	{
+		AppendLog(TEXT("Added one editable wall. Place it with the viewport gizmos and grid snapping."), EFloorPlanLogSeverity::Success);
+		StatusText = LOCTEXT("StatusAddedWall", "Added a wall in FloorPlan_Walls. Move, rotate, or scale it with native gizmos.");
+	}
+	else
+	{
+		StatusText = LOCTEXT("StatusAddWallFailed", "Add Wall failed. See the log for the reason.");
+	}
+	return FReply::Handled();
+}
+
+FReply SFloorPlanImportPanel::OnExportClicked()
+{
+	FString Result;
+	if (!ExecPython(
+		TEXT("__import__('floorplan_panel').export_corrected_walls()"),
+		LOCTEXT("ExportingWalls", "Exporting corrected walls..."),
+		Result))
+	{
+		return FReply::Handled();
+	}
+
+	Result.TrimStartAndEndInline();
+	Result.TrimCharInline(TEXT('\''));
+	Result.TrimCharInline(TEXT('"'));
+	if (Result.IsEmpty())
+	{
+		StatusText = LOCTEXT("StatusExportFailed", "Export failed. Detect or add walls first, then try again.");
+		return FReply::Handled();
+	}
+
+	AppendLog(FString::Printf(TEXT("Exported corrected walls to %s"), *Result), EFloorPlanLogSeverity::Success);
+	StatusText = FText::Format(
+		LOCTEXT("StatusExported", "Exported corrected walls to {0}."),
+		FText::FromString(Result));
 	return FReply::Handled();
 }
 
@@ -597,8 +678,10 @@ FString SFloorPlanImportPanel::BuildOptionsJson() const
 	return Output;
 }
 
-void SFloorPlanImportPanel::RunImport()
+bool SFloorPlanImportPanel::ExecPython(const FString& Command, const FText& SlowTaskText, FString& OutResult)
 {
+	OutResult.Reset();
+
 	IPythonScriptPlugin* Python = IPythonScriptPlugin::Get();
 	if (!Python || !Python->IsPythonAvailable())
 	{
@@ -606,29 +689,23 @@ void SFloorPlanImportPanel::RunImport()
 			TEXT("Python is not available. Enable the Python Editor Script Plugin, then restart the editor."),
 			EFloorPlanLogSeverity::Error);
 		StatusText = LOCTEXT("StatusNoPython", "Failed: Python is not available.");
-		return;
+		return false;
 	}
 
 	bIsRunning = true;
 	ON_SCOPE_EXIT { bIsRunning = false; };
 
 	AppendLog(TEXT("----------------------------------------"), EFloorPlanLogSeverity::Info);
-	AppendLog(
-		FString::Printf(TEXT("Detecting editable walls from %s"), *FloorPlanPath),
-		EFloorPlanLogSeverity::Info);
 
 	FPythonCommandEx PythonCommand;
 	PythonCommand.ExecutionMode = EPythonCommandExecutionMode::EvaluateStatement;
-	PythonCommand.Command = FString::Printf(
-		TEXT("__import__('floorplan_panel').run_from_json(%s)"),
-		*FloorPlanImportPanel::ToPythonLiteral(BuildOptionsJson()));
+	PythonCommand.Command = Command;
 
 	bool bCommandSucceeded = false;
 	{
-		FScopedSlowTask SlowTask(1.0f, LOCTEXT("Detecting", "Detecting and spawning editable wall actors..."));
+		FScopedSlowTask SlowTask(1.0f, SlowTaskText);
 		SlowTask.MakeDialog();
 		SlowTask.EnterProgressFrame(1.0f);
-
 		bCommandSucceeded = Python->ExecPythonCommandEx(PythonCommand);
 	}
 
@@ -637,14 +714,28 @@ void SFloorPlanImportPanel::RunImport()
 		AppendLog(Entry.Output, FloorPlanImportPanel::FromPythonLogType(Entry.Type));
 	}
 
+	OutResult = PythonCommand.CommandResult;
 	if (!bCommandSucceeded)
 	{
 		AppendLog(PythonCommand.CommandResult, EFloorPlanLogSeverity::Error);
 		StatusText = LOCTEXT("StatusPythonError", "Failed: the Python pipeline raised an error. See the log.");
+		return false;
+	}
+	return true;
+}
+
+void SFloorPlanImportPanel::RunImport()
+{
+	FString Result;
+	const FString Command = FString::Printf(
+		TEXT("__import__('floorplan_panel').run_from_json(%s)"),
+		*FloorPlanImportPanel::ToPythonLiteral(BuildOptionsJson()));
+	if (!ExecPython(Command, LOCTEXT("Detecting", "Detecting and spawning editable wall actors..."), Result))
+	{
 		return;
 	}
 
-	const int32 WallCount = FCString::Atoi(*PythonCommand.CommandResult);
+	const int32 WallCount = FCString::Atoi(*Result);
 	if (WallCount > 0)
 	{
 		AppendLog(

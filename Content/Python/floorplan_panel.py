@@ -62,11 +62,16 @@ def run_from_json(payload: str) -> int:
         return -1
 
 
-def add_wall() -> int:
-    """Editor Utility Widget / Python console entry point for Add Wall."""
+def add_wall(
+    length_cm: float = 200.0,
+    thickness_cm: float = 15.0,
+    height_cm: float = 300.0,
+    generate_collision: bool = True,
+) -> int:
+    """Editor panel / Python console entry point for Add Wall."""
     try:
         router = _reload_pipeline()
-        return 1 if router.add_wall() else 0
+        return 1 if router.add_wall(length_cm, thickness_cm, height_cm, generate_collision) else 0
     except Exception as exc:
         unreal.log_error(f"Add Wall failed: {exc}")
         for line in traceback.format_exc().splitlines():
