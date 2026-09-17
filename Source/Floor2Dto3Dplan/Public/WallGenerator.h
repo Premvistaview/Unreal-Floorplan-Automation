@@ -25,6 +25,14 @@ struct FLOOR2DTO3DPLAN_API FWallSegment
 
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Wall", meta = (ClampMin = "0.1"))
     float Thickness = 15.0f;
+
+    /**
+     * 1-based index of the raw detection this wall came from, or -1 for a
+     * wall added by hand. Lets Finalize report removed/added/adjusted counts
+     * after the array has been edited.
+     */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Wall", AdvancedDisplay)
+    int32 SourceIndex = -1;
 };
 
 /** Native, editor-friendly wall generator. All dimensions are Unreal centimetres. */
@@ -64,6 +72,14 @@ public:
     /** Rebuild from the current editable WallSegments and WallHeight values. */
     UFUNCTION(CallInEditor, BlueprintCallable, Category = "Wall Generator")
     bool RebuildMesh();
+
+    /** Append one wall (undo-friendly) and rebuild. Returns the new segment's index. */
+    UFUNCTION(BlueprintCallable, Category = "Wall Generator")
+    int32 AddWallSegment(const FWallSegment& Segment);
+
+    /** Remove the wall at Index (undo-friendly) and rebuild. False if Index is out of range. */
+    UFUNCTION(BlueprintCallable, Category = "Wall Generator")
+    bool RemoveWallSegmentAt(int32 Index);
 
     /** Uses the generated triangles for collision, immediately in the editor. */
     UFUNCTION(CallInEditor, BlueprintCallable, Category = "Wall Generator")

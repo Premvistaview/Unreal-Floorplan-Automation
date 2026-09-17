@@ -3,16 +3,17 @@
 #include "SFloorPlanImportPanel.h"
 
 #include "DesktopPlatformModule.h"
+#include "Dom/JsonObject.h"
+#include "Dom/JsonValue.h"
+#include "Floor2Dto3DplanEditorModule.h"
+#include "FloorPlanPythonBridge.h"
 #include "Framework/Application/SlateApplication.h"
 #include "HAL/PlatformApplicationMisc.h"
 #include "IDesktopPlatform.h"
-#include "IPythonScriptPlugin.h"
 #include "Misc/ConfigCacheIni.h"
 #include "Misc/Paths.h"
 #include "Misc/ScopeExit.h"
-#include "Misc/ScopedSlowTask.h"
 #include "Policies/CondensedJsonPrintPolicy.h"
-#include "PythonScriptTypes.h"
 #include "Serialization/JsonWriter.h"
 #include "Styling/AppStyle.h"
 #include "Styling/CoreStyle.h"
@@ -69,17 +70,6 @@ namespace FloorPlanImportPanel
 		default:
 			return EFloorPlanLogSeverity::Info;
 		}
-	}
-
-	/** Wraps a string as a single-quoted Python literal, escaping what Python would otherwise interpret. */
-	FString ToPythonLiteral(const FString& Value)
-	{
-		FString Escaped = Value;
-		Escaped.ReplaceInline(TEXT("\\"), TEXT("\\\\"), ESearchCase::CaseSensitive);
-		Escaped.ReplaceInline(TEXT("'"), TEXT("\\'"), ESearchCase::CaseSensitive);
-		Escaped.ReplaceInline(TEXT("\r"), TEXT(""), ESearchCase::CaseSensitive);
-		Escaped.ReplaceInline(TEXT("\n"), TEXT("\\n"), ESearchCase::CaseSensitive);
-		return FString::Printf(TEXT("'%s'"), *Escaped);
 	}
 
 	TSharedRef<SWidget> LabeledRow(const FText& Label, const FText& Tooltip, TSharedRef<SWidget> Content)
@@ -152,7 +142,7 @@ void SFloorPlanImportPanel::Construct(const FArguments& InArgs)
 	];
 
 	AppendLog(
-		TEXT("Panel ready. Detection creates one independently selectable wall actor per segment in FloorPlan_Walls."),
+		TEXT("Panel ready. Detection stages every wall in one FloorPlan_Walls actor and opens the Wall Correction window."),
 		EFloorPlanLogSeverity::Info);
 }
 
@@ -170,7 +160,7 @@ TSharedRef<SWidget> SFloorPlanImportPanel::BuildSourceSection()
 		[
 			FloorPlanImportPanel::LabeledRow(
 				LOCTEXT("FileLabel", "Floor plan file"),
-				LOCTEXT("FileTooltip", "PNG, JPG, JPEG, PDF, DWG, or DXF."),
+				LOCTEXT("FileTooltip", "PNG, JPG, JPEG, PDF, DWG, or DXF. Images are also imported into the project so the Wall Correction window can show them."),
 				SNew(SHorizontalBox)
 				+ SHorizontalBox::Slot()
 				.FillWidth(1.0f)
@@ -208,7 +198,7 @@ TSharedRef<SWidget> SFloorPlanImportPanel::BuildSettingsSection()
 		[
 			FloorPlanImportPanel::LabeledRow(
 				LOCTEXT("PixelsPerFootLabel", "Pixels per foot"),
-				LOCTEXT("PixelsPerFootTooltip", "Raster scale: how many image pixels span one foot on the drawing. Used for PNG, JPG, and rasterised PDF."),
+				LOCTEXT("PixelsPerFootTooltip", "Raster scale: how many image pixels span one foot on the drawing. Used for PNG, JPG, and rasterised PDF, and to place the image behind the walls in the Wall Correction window."),
 				SNew(SNumericEntryBox<float>)
 				.AllowSpin(false)
 				.MinValue(0.01f)
@@ -236,7 +226,7 @@ TSharedRef<SWidget> SFloorPlanImportPanel::BuildSettingsSection()
 		[
 			FloorPlanImportPanel::LabeledRow(
 				LOCTEXT("ThicknessLabel", "Fallback thickness (cm)"),
-				LOCTEXT("ThicknessTooltip", "Thickness used when a wall's two faces cannot be paired up in the drawing."),
+				LOCTEXT("ThicknessTooltip", "Thickness used when a wall's two faces cannot be paired up in the drawing, and for walls you draw by hand."),
 				SNew(SNumericEntryBox<float>)
 				.AllowSpin(false)
 				.MinValue(0.1f)
@@ -345,6 +335,23 @@ TSharedRef<SWidget> SFloorPlanImportPanel::BuildSettingsSection()
 				{
 					bGenerateCollision = (NewState == ECheckBoxState::Checked);
 				}))
+		]
+		+ SVerticalBox::Slot()
+		.AutoHeight()
+		.Padding(0.0f, 4.0f, 0.0f, 0.0f)
+		[
+			FloorPlanImportPanel::LabeledRow(
+				LOCTEXT("CombinedLabel", "Single combined actor"),
+				LOCTEXT("CombinedTooltip", "Checked: every wall lives in one FloorPlan_Walls Blueprint actor (BP_FloorPlanWalls) whose WallSegments array the Wall Correction window edits. Unchecked: one selectable actor per wall so each can be moved with the viewport gizmos."),
+				SNew(SCheckBox)
+				.IsChecked_Lambda([this]()
+				{
+					return bCombinedActor ? ECheckBoxState::Checked : ECheckBoxState::Unchecked;
+				})
+				.OnCheckStateChanged_Lambda([this](const ECheckBoxState NewState)
+				{
+					bCombinedActor = (NewState == ECheckBoxState::Checked);
+				}))
 		];
 }
 
@@ -365,8 +372,9 @@ TSharedRef<SWidget> SFloorPlanImportPanel::BuildActionSection()
 			.AutoWidth()
 			[
 				SNew(SButton)
+				.ButtonStyle(FAppStyle::Get(), "PrimaryButton")
 				.Text(LOCTEXT("Generate", "Detect Editable Walls"))
-				.ToolTipText(LOCTEXT("GenerateTooltip", "Detect walls and create one selectable BP_WallSegment/native wall actor per result."))
+				.ToolTipText(LOCTEXT("GenerateTooltip", "Detect walls, stage them in the level, import the plan image, and open the Wall Correction window."))
 				.IsEnabled_Lambda([this]() { return CanGenerate(); })
 				.OnClicked(this, &SFloorPlanImportPanel::OnGenerateClicked)
 			]
@@ -375,20 +383,10 @@ TSharedRef<SWidget> SFloorPlanImportPanel::BuildActionSection()
 			.Padding(8.0f, 0.0f, 0.0f, 0.0f)
 			[
 				SNew(SButton)
-				.Text(LOCTEXT("AddWall", "Add Wall"))
-				.ToolTipText(LOCTEXT("AddWallTooltip", "Spawn a short new wall at the viewport focus and parent it under FloorPlan_Walls."))
-				.IsEnabled_Lambda([this]() { return CanRunCorrectionTools(); })
-				.OnClicked(this, &SFloorPlanImportPanel::OnAddWallClicked)
-			]
-			+ SHorizontalBox::Slot()
-			.AutoWidth()
-			.Padding(8.0f, 0.0f, 0.0f, 0.0f)
-			[
-				SNew(SButton)
-				.Text(LOCTEXT("ExportWalls", "Export walls.json"))
-				.ToolTipText(LOCTEXT("ExportWallsTooltip", "Write the current FloorPlan_Walls actors, including viewport transforms, to Saved/FloorPlan/walls.json."))
-				.IsEnabled_Lambda([this]() { return CanRunCorrectionTools(); })
-				.OnClicked(this, &SFloorPlanImportPanel::OnExportClicked)
+				.Text(LOCTEXT("OpenCorrection", "Open Wall Correction"))
+				.ToolTipText(LOCTEXT("OpenCorrectionTooltip", "Open the Wall Correction window for the current floor plan and settings without re-detecting."))
+				.IsEnabled_Lambda([this]() { return !bIsRunning; })
+				.OnClicked(this, &SFloorPlanImportPanel::OnOpenCorrectionClicked)
 			]
 			+ SHorizontalBox::Slot()
 			.FillWidth(1.0f)
@@ -468,11 +466,6 @@ bool SFloorPlanImportPanel::CanGenerate() const
 	return !bIsRunning && !FloorPlanPath.IsEmpty();
 }
 
-bool SFloorPlanImportPanel::CanRunCorrectionTools() const
-{
-	return !bIsRunning;
-}
-
 FReply SFloorPlanImportPanel::OnBrowseClicked()
 {
 	IDesktopPlatform* DesktopPlatform = FDesktopPlatformModule::Get();
@@ -541,59 +534,10 @@ FReply SFloorPlanImportPanel::OnGenerateClicked()
 	return FReply::Handled();
 }
 
-FReply SFloorPlanImportPanel::OnAddWallClicked()
+FReply SFloorPlanImportPanel::OnOpenCorrectionClicked()
 {
 	SaveSettings();
-
-	const FString Command = FString::Printf(
-		TEXT("__import__('floorplan_panel').add_wall(200.0, %f, %f, %s)"),
-		DefaultThicknessCm,
-		WallHeightCm,
-		bGenerateCollision ? TEXT("True") : TEXT("False"));
-
-	FString Result;
-	if (!ExecPython(Command, LOCTEXT("AddingWall", "Adding a wall actor..."), Result))
-	{
-		return FReply::Handled();
-	}
-
-	const int32 Added = FCString::Atoi(*Result);
-	if (Added > 0)
-	{
-		AppendLog(TEXT("Added one editable wall. Place it with the viewport gizmos and grid snapping."), EFloorPlanLogSeverity::Success);
-		StatusText = LOCTEXT("StatusAddedWall", "Added a wall in FloorPlan_Walls. Move, rotate, or scale it with native gizmos.");
-	}
-	else
-	{
-		StatusText = LOCTEXT("StatusAddWallFailed", "Add Wall failed. See the log for the reason.");
-	}
-	return FReply::Handled();
-}
-
-FReply SFloorPlanImportPanel::OnExportClicked()
-{
-	FString Result;
-	if (!ExecPython(
-		TEXT("__import__('floorplan_panel').export_corrected_walls()"),
-		LOCTEXT("ExportingWalls", "Exporting corrected walls..."),
-		Result))
-	{
-		return FReply::Handled();
-	}
-
-	Result.TrimStartAndEndInline();
-	Result.TrimCharInline(TEXT('\''));
-	Result.TrimCharInline(TEXT('"'));
-	if (Result.IsEmpty())
-	{
-		StatusText = LOCTEXT("StatusExportFailed", "Export failed. Detect or add walls first, then try again.");
-		return FReply::Handled();
-	}
-
-	AppendLog(FString::Printf(TEXT("Exported corrected walls to %s"), *Result), EFloorPlanLogSeverity::Success);
-	StatusText = FText::Format(
-		LOCTEXT("StatusExported", "Exported corrected walls to {0}."),
-		FText::FromString(Result));
+	OpenCorrectionForCurrentSettings(/*bImportImage*/ true);
 	return FReply::Handled();
 }
 
@@ -670,8 +614,11 @@ FString SFloorPlanImportPanel::BuildOptionsJson() const
 	Writer->WriteValue(TEXT("cad_layer_filter"), CadLayerFilter);
 	Writer->WriteValue(TEXT("oda_converter_path"), OdaConverterPath);
 	Writer->WriteValue(TEXT("generate_collision"), bGenerateCollision);
+	Writer->WriteValue(TEXT("combined_actor"), bCombinedActor);
 	// The panel surfaces failures in its own log, so suppress the modal dialogs.
 	Writer->WriteValue(TEXT("show_dialogs"), false);
+	// The native Wall Correction window is opened by this panel, not by Python.
+	Writer->WriteValue(TEXT("open_correction_ui"), false);
 	Writer->WriteObjectEnd();
 	Writer->Close();
 
@@ -680,44 +627,27 @@ FString SFloorPlanImportPanel::BuildOptionsJson() const
 
 bool SFloorPlanImportPanel::ExecPython(const FString& Command, const FText& SlowTaskText, FString& OutResult)
 {
-	OutResult.Reset();
-
-	IPythonScriptPlugin* Python = IPythonScriptPlugin::Get();
-	if (!Python || !Python->IsPythonAvailable())
-	{
-		AppendLog(
-			TEXT("Python is not available. Enable the Python Editor Script Plugin, then restart the editor."),
-			EFloorPlanLogSeverity::Error);
-		StatusText = LOCTEXT("StatusNoPython", "Failed: Python is not available.");
-		return false;
-	}
-
 	bIsRunning = true;
 	ON_SCOPE_EXIT { bIsRunning = false; };
 
 	AppendLog(TEXT("----------------------------------------"), EFloorPlanLogSeverity::Info);
 
-	FPythonCommandEx PythonCommand;
-	PythonCommand.ExecutionMode = EPythonCommandExecutionMode::EvaluateStatement;
-	PythonCommand.Command = Command;
-
-	bool bCommandSucceeded = false;
+	const FFloorPlanPythonResult Outcome = FloorPlanPython::Exec(Command, /*bShowProgress*/ true, SlowTaskText);
+	for (const FFloorPlanPythonLogLine& Line : Outcome.Log)
 	{
-		FScopedSlowTask SlowTask(1.0f, SlowTaskText);
-		SlowTask.MakeDialog();
-		SlowTask.EnterProgressFrame(1.0f);
-		bCommandSucceeded = Python->ExecPythonCommandEx(PythonCommand);
+		AppendLog(Line.Text, FloorPlanImportPanel::FromPythonLogType(Line.Type));
 	}
 
-	for (const FPythonLogOutputEntry& Entry : PythonCommand.LogOutput)
+	OutResult = Outcome.Result;
+	if (!Outcome.bPythonAvailable)
 	{
-		AppendLog(Entry.Output, FloorPlanImportPanel::FromPythonLogType(Entry.Type));
+		AppendLog(Outcome.Result, EFloorPlanLogSeverity::Error);
+		StatusText = LOCTEXT("StatusNoPython", "Failed: Python is not available.");
+		return false;
 	}
-
-	OutResult = PythonCommand.CommandResult;
-	if (!bCommandSucceeded)
+	if (!Outcome.bSucceeded)
 	{
-		AppendLog(PythonCommand.CommandResult, EFloorPlanLogSeverity::Error);
+		AppendLog(Outcome.Result, EFloorPlanLogSeverity::Error);
 		StatusText = LOCTEXT("StatusPythonError", "Failed: the Python pipeline raised an error. See the log.");
 		return false;
 	}
@@ -729,30 +659,73 @@ void SFloorPlanImportPanel::RunImport()
 	FString Result;
 	const FString Command = FString::Printf(
 		TEXT("__import__('floorplan_panel').run_from_json(%s)"),
-		*FloorPlanImportPanel::ToPythonLiteral(BuildOptionsJson()));
-	if (!ExecPython(Command, LOCTEXT("Detecting", "Detecting and spawning editable wall actors..."), Result))
+		*FloorPlanPython::ToPythonLiteral(BuildOptionsJson()));
+	if (!ExecPython(Command, LOCTEXT("Detecting", "Detecting and staging walls..."), Result))
 	{
 		return;
 	}
 
-	const int32 WallCount = FCString::Atoi(*Result);
+	const int32 WallCount = FloorPlanPython::ResultToInt(Result);
 	if (WallCount > 0)
 	{
 		AppendLog(
-			FString::Printf(TEXT("Done. Spawned %d editable wall actor(s)."), WallCount),
+			FString::Printf(TEXT("Done. Staged %d wall(s)."), WallCount),
 			EFloorPlanLogSeverity::Success);
 		StatusText = FText::Format(
-			LOCTEXT("StatusSuccess", "Spawned {0} editable wall actor(s) in FloorPlan_Walls."),
+			LOCTEXT("StatusSuccess", "{0} walls detected. Review them in the Wall Correction window."),
 			FText::AsNumber(WallCount));
+
+		AppendLog(TEXT("Opening wall correction UI..."), EFloorPlanLogSeverity::Info);
+		OpenCorrectionForCurrentSettings(/*bImportImage*/ true);
 	}
 	else if (WallCount == 0)
 	{
-		StatusText = LOCTEXT("StatusNoWalls", "No walls were detected. Try adjusting the scale or layer filter.");
+		StatusText = LOCTEXT("StatusNoWalls", "No walls were detected. Try adjusting the scale or layer filter, or draw them in the Wall Correction window.");
 	}
 	else
 	{
 		StatusText = LOCTEXT("StatusFailed", "Import failed. See the log for the reason.");
 	}
+}
+
+void SFloorPlanImportPanel::OpenCorrectionForCurrentSettings(const bool bImportImage)
+{
+	FWallCorrectionContext Context;
+	Context.SourcePath = FloorPlanPath;
+	Context.PixelsPerFoot = PixelsPerFoot;
+	Context.WallHeightCm = WallHeightCm;
+	Context.DefaultThicknessCm = DefaultThicknessCm;
+	Context.bGenerateCollision = bGenerateCollision;
+	Context.bCombinedActor = bCombinedActor;
+
+	if (bImportImage && !FloorPlanPath.IsEmpty())
+	{
+		FString Result;
+		const FString Command = FString::Printf(
+			TEXT("__import__('floorplan_panel').import_floorplan_texture_payload(%s)"),
+			*FloorPlanPython::ToPythonLiteral(FloorPlanPath));
+
+		TSharedPtr<FJsonValue> Payload;
+		const TSharedPtr<FJsonObject>* Info = nullptr;
+		if (ExecPython(Command, LOCTEXT("ImportingImage", "Importing the floor plan image..."), Result)
+			&& FloorPlanPython::DecodePayload(Result, Payload)
+			&& Payload->TryGetObject(Info)
+			&& Info)
+		{
+			Context.TextureAssetPath = (*Info)->GetStringField(TEXT("asset_path"));
+		}
+		else
+		{
+			// Vector sources (PDF/DXF/DWG) have no raster; the window shows lines only.
+			const FWallCorrectionContext& Previous = FFloor2Dto3DplanEditorModule::GetLastContext();
+			if (Previous.SourcePath == FloorPlanPath)
+			{
+				Context.TextureAssetPath = Previous.TextureAssetPath;
+			}
+		}
+	}
+
+	FFloor2Dto3DplanEditorModule::OpenWallCorrection(Context);
 }
 
 void SFloorPlanImportPanel::LoadSettings()
@@ -773,6 +746,7 @@ void SFloorPlanImportPanel::LoadSettings()
 	GConfig->GetFloat(Section, TEXT("RasterDpi"), RasterDpi, GEditorPerProjectIni);
 	GConfig->GetInt(Section, TEXT("PdfPageIndex"), PdfPageIndex, GEditorPerProjectIni);
 	GConfig->GetBool(Section, TEXT("GenerateCollision"), bGenerateCollision, GEditorPerProjectIni);
+	GConfig->GetBool(Section, TEXT("CombinedActor"), bCombinedActor, GEditorPerProjectIni);
 }
 
 void SFloorPlanImportPanel::SaveSettings() const
@@ -793,6 +767,7 @@ void SFloorPlanImportPanel::SaveSettings() const
 	GConfig->SetFloat(Section, TEXT("RasterDpi"), RasterDpi, GEditorPerProjectIni);
 	GConfig->SetInt(Section, TEXT("PdfPageIndex"), PdfPageIndex, GEditorPerProjectIni);
 	GConfig->SetBool(Section, TEXT("GenerateCollision"), bGenerateCollision, GEditorPerProjectIni);
+	GConfig->SetBool(Section, TEXT("CombinedActor"), bCombinedActor, GEditorPerProjectIni);
 	GConfig->Flush(false, GEditorPerProjectIni);
 }
 

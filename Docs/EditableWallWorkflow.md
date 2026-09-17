@@ -197,6 +197,57 @@ no staged walls yet.
    A detected wall counts as adjusted when its centreline or thickness moved
    by more than 0.5 cm.
 4. Writes `<Project>/Saved/FloorPlan/walls_corrected.json`.
+5. **Bakes the walls to a Static Mesh** (see below).
+
+### Final bake: Dynamic Mesh → Static Mesh
+
+Dynamic Mesh components are right for the correction phase, where the walls
+rebuild live, but the deliverable needs to be a real Static Mesh asset for
+rendering performance, lightmaps, standard collision, and Nanite. So the last
+thing Finalize does — and only Finalize; the bake is one-directional — is
+call `UFloorPlanAssetLibrary::BakeWallsToStaticMesh`:
+
+- **Combined mode:** the `FloorPlan_Walls` actor's single Dynamic Mesh is
+  baked in the actor's local space and the result is placed at the actor's
+  transform.
+- **Individual mode:** every `WallSegmentActor` mesh is first merged into one
+  Dynamic Mesh with Geometry Script `AppendMesh` (each with its world
+  transform), so the output is always exactly one Static Mesh, never one per
+  wall. The log records `Merged N wall actor(s) into one mesh`.
+- **UVs:** UV0 is a box projection sized to the mesh (a sane material
+  mapping for box-shaped walls); UV1 is a non-overlapping XAtlas atlas for
+  lightmaps. The asset's lightmap coordinate index is set to 1, its build
+  settings keep `Generate Lightmap UVs` on (source 0 → destination 1), and
+  the default lightmap resolution is 128.
+- **Collision:** the Dynamic Mesh's complex-as-simple collision does not
+  carry over, so the bake generates one **oriented box** per wall on the
+  Static Mesh via Geometry Script `SetStaticMeshCollisionFromMesh` and sets
+  the trace flag to *Use Default*. If no simple shapes could be produced it
+  falls back to complex-as-simple. Logged as
+  `Collision generated on Static Mesh: N oriented box(es)`.
+- **Asset:** saved as `/Game/FloorPlan/Meshes/SM_FloorPlanWalls`, with a
+  numeric suffix if that name already exists. Normals and tangents are
+  recomputed; Nanite is off by default (`BAKE_ENABLE_NANITE` in the router).
+- **Level:** a Static Mesh Actor labelled `FloorPlanWalls_Baked`, tagged
+  `FloorPlanBakedWalls`, is spawned in the `FloorPlan_Walls` folder and the
+  Dynamic Mesh actor(s) are destroyed, so the level ends up with one clean
+  actor. Logged as
+  `Finalized: Static Mesh Actor placed, N Dynamic Mesh actor(s) removed`.
+
+After a bake the Wall Correction list is empty (there is nothing left to
+correct). To make further changes, run Detect again or draw new walls — that
+stages fresh Dynamic Mesh walls without touching the baked asset. Baked
+actors are left alone by re-detection.
+
+To finalize without baking (keep the Dynamic Mesh actors):
+
+```python
+import floorplan_panel
+floorplan_panel.finalize_walls("", bake=False)
+```
+
+If the editor has not been rebuilt with `BakeWallsToStaticMesh`, Finalize
+logs a warning, skips the bake, and leaves the Dynamic Mesh actors in place.
 
 The raw detection is saved separately, once per run, to
 `<Project>/Saved/FloorPlan/walls.json` and is never modified afterwards, so
@@ -234,7 +285,7 @@ the Python console, Blueprints, or an Editor Utility Widget:
 | `add_wall(length_cm, thickness_cm, height_cm, generate_collision, combined=True)` | Add a wall at the viewport focus (a new `WallSegments` entry, or a new actor) and log `User added wall #N`. Returns 1/0. |
 | `add_wall_at(x1, y1, x2, y2, thickness_cm, height_cm, generate_collision, combined=True)` | Add a wall between two world points (cm), as drawn in the Wall Correction window. Returns the new wall id or "". |
 | `import_floorplan_texture_payload(image_path)` | Import a PNG/JPG as `/Game/FloorPlan/Sources/T_<name>`. Base64 JSON `{asset_path, width, height}` or "" for vector sources. |
-| `finalize_walls(output_path="")` | Collision + `walls_corrected.json` + summary log. Returns base64 JSON of `{final, detected, removed, added, adjusted, corrections, path}`. |
+| `finalize_walls(output_path="", bake=True)` | Collision + `walls_corrected.json` + summary log + Static Mesh bake. Returns base64 JSON of `{final, detected, removed, added, adjusted, corrections, path, mode, static_mesh, actor}` (the last two only when the bake ran). |
 | `open_correction_ui()` | Opens `EUW_WallCorrection` if that asset exists; returns 0 when the native panel should be used instead. |
 
 ## Optional: EUW_WallCorrection Editor Utility Widget
@@ -306,3 +357,8 @@ Log or the panel's log view:
 - `User removed wall #N (Wall_NNN).`
 - `User added wall #N (Wall_NNN) at the viewport focus plane. ...`
 - `Finalized: N walls, M corrections applied (R removed, A added, J adjusted). Wrote <path>`
+- `Baking corrected walls to Static Mesh...`
+- `Merged N wall actor(s) into one mesh (T triangles).` (individual mode)
+- `Static Mesh asset created: /Game/FloorPlan/Meshes/SM_FloorPlanWalls`
+- `Collision generated on Static Mesh: N oriented box(es).`
+- `Finalized: Static Mesh Actor 'FloorPlanWalls_Baked' placed, N Dynamic Mesh actor(s) removed.`

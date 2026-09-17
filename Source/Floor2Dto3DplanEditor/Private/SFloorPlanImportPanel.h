@@ -28,11 +28,13 @@ struct FFloorPlanLogLine
 };
 
 /**
- * Dockable panel that drives the floor-plan-to-walls pipeline.
+ * Dockable panel that drives detection.
  *
- * Detection and actor spawning stay in Python; this panel collects the
+ * Detection and actor staging stay in Python; this panel collects the
  * settings, runs the bridge module, and mirrors the Python log locally so the
- * user never has to dig through the Output Log.
+ * user never has to dig through the Output Log. When detection succeeds it
+ * imports the plan image into the project and opens the Wall Correction
+ * window, where the result is reviewed and fixed by hand.
  */
 class SFloorPlanImportPanel : public SCompoundWidget
 {
@@ -55,13 +57,11 @@ private:
 	FReply OnBrowseClicked();
 	FReply OnBrowseOdaClicked();
 	FReply OnGenerateClicked();
-	FReply OnAddWallClicked();
-	FReply OnExportClicked();
+	FReply OnOpenCorrectionClicked();
 	FReply OnClearLogClicked();
 	FReply OnCopyLogClicked();
 
 	bool CanGenerate() const;
-	bool CanRunCorrectionTools() const;
 
 	/** Appends text to the log, splitting embedded newlines into separate rows. */
 	void AppendLog(const FString& Text, EFloorPlanLogSeverity Severity);
@@ -71,6 +71,9 @@ private:
 
 	/** Runs the Python bridge and mirrors its captured output into the log. */
 	void RunImport();
+
+	/** Imports the plan image as a texture and opens the Wall Correction window for this run. */
+	void OpenCorrectionForCurrentSettings(bool bImportImage);
 
 	/** Serialises the current settings for the Python bridge. */
 	FString BuildOptionsJson() const;
@@ -92,6 +95,8 @@ private:
 	float RasterDpi = 300.0f;
 	int32 PdfPageIndex = 0;
 	bool bGenerateCollision = true;
+	/** One WallGeneratorActor holding every wall (true) or one actor per wall (false). */
+	bool bCombinedActor = true;
 
 	FText StatusText;
 	bool bIsRunning = false;

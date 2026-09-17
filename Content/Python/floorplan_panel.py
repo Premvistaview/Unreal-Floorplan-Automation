@@ -179,13 +179,13 @@ def import_floorplan_texture_payload(image_path: str) -> str:
         return ""
 
 
-def finalize_walls(output_path: str = "") -> str:
-    """Apply collision, export walls_corrected.json, and return a base64 JSON
-    summary {final, detected, removed, added, adjusted, corrections, path}.
-    Empty string on failure."""
+def finalize_walls(output_path: str = "", bake: bool = True) -> str:
+    """Apply collision, export walls_corrected.json, bake to a Static Mesh, and
+    return a base64 JSON summary {final, detected, removed, added, adjusted,
+    corrections, path, mode, static_mesh?, actor?}. Empty string on failure."""
     try:
         router = _reload_pipeline()
-        return _payload(router.finalize_walls(output_path))
+        return _payload(router.finalize_walls(output_path, bake))
     except Exception as exc:
         _report("Finalize failed", exc)
         return ""
