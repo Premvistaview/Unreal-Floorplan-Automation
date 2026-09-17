@@ -46,6 +46,12 @@ for wall in walls:
 if len(walls) != 4:
     raise SystemExit(f"FAIL: expected 4 walls, got {len(walls)}")
 
+# 10 px stroke at 10 px/ft is exactly 12 in; thickness must snap to that standard.
+expected_thickness = 12.0 * fd.CM_PER_INCH
+for wall in walls:
+    if abs(wall["thickness"] - expected_thickness) > 0.01:
+        raise SystemExit(f"FAIL: thickness {wall['thickness']} did not snap to 12in ({expected_thickness})")
+
 # Next-stage cleanup: a T-junction with a small gap should snap shut.
 gapped = [
     {"start": [0.0, 100.0], "end": [100.0, 100.0], "thickness": 15.0},

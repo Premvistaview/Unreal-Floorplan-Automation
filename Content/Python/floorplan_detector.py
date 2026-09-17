@@ -17,7 +17,7 @@ Line = Tuple[float, float, float, float]
 Seg = Tuple[float, float, float, float, float]
 
 # Bump when editing this file; the log line proves which copy the editor loaded.
-DETECTOR_REVISION = "2026-09-03-junction-cleanup"
+DETECTOR_REVISION = "2026-09-16-standard-thickness"
 
 # Raster (pixels)
 SNAP_ANGLE_DEG = 12.0
@@ -27,6 +27,23 @@ PAIR_MAX_GAP_PX = 80.0
 PAIR_MIN_OVERLAP_PX = 8.0
 MERGE_GAP_PX = 12.0
 MERGE_OFFSET_PX = 3.0
+# Marks a line that found no parallel partner, so its thickness was never
+# measured. Negative so _merge_group's max() prefers a measured value when a
+# paired and an unpaired fragment of the same wall are merged.
+UNPAIRED_THICKNESS_PX = -1.0
+# The pair gap is the distance between Canny edge-pixel centres, which sits
+# one pixel wide of the drawn stroke (measured as exactly +1.0 px for every
+# stroke width from 4 to 22 px). Removed before converting to real units.
+EDGE_PAIR_BIAS_PX = 1.0
+
+# Wall thickness standards. A measured parallel-pair gap is snapped to the
+# nearest of these (common stud and masonry widths) to remove pixel jitter;
+# a gap farther than the tolerance from every standard is treated as a
+# false pairing and falls back to the caller's default thickness.
+CM_PER_INCH = 2.54
+STANDARD_WALL_THICKNESSES_IN: Tuple[float, ...] = (4.0, 6.0, 8.0, 10.0, 12.0)
+THICKNESS_SNAP_TOLERANCE_IN = 1.5
+MAX_THICKNESS_WARNINGS = 10   # per detection run; the rest are summarised
 
 # World-space cleanup (Unreal centimetres)
 JUNCTION_SNAP_CM = 12.0
@@ -120,23 +137,103 @@ def detect_walls_from_image(
         _log("ERROR: IMAGE_PIXELS_PER_FOOT must be > 0.", log)
         return []
     cm_per_pixel = 30.48 / pixels_per_foot
-    default_thickness_px = max(default_thickness_cm / cm_per_pixel, PAIR_MIN_GAP_PX)
-    paired = _pair_parallel_walls(collapsed, PAIR_MIN_GAP_PX, PAIR_MAX_GAP_PX, default_thickness_px)
+    paired = _pair_parallel_walls(collapsed, PAIR_MIN_GAP_PX, PAIR_MAX_GAP_PX, UNPAIRED_THICKNESS_PX)
     merged = _merge_colinear(paired, MERGE_GAP_PX, MERGE_OFFSET_PX)
 
-    walls: List[Wall] = []
-    for x1, y1, x2, y2, thickness_px in merged:
-        # Image Y grows downward; Unreal XY uses Y up on the floor plane.
-        start = (x1 * cm_per_pixel, (height - y1) * cm_per_pixel)
-        end = (x2 * cm_per_pixel, (height - y2) * cm_per_pixel)
-        thickness = max(thickness_px * cm_per_pixel, default_thickness_cm * 0.25)
-        walls.append(_seg(start, end, thickness))
+    _log("7. Snap measured wall thickness to standard widths.", log)
+    walls, distribution = _walls_from_pixel_segments(merged, height, cm_per_pixel, default_thickness_cm, log)
+    _log_thickness_distribution(distribution, log)
 
     walls = cleanup_walls(walls)
-    _log(f"7. Raster route produced {len(walls)} wall segment(s).", log)
+    _log(f"8. Raster route produced {len(walls)} wall segment(s).", log)
     if not walls:
         _log("ERROR: No usable walls after pairing/merge. Try a cleaner scan or different pixels-per-foot.", log)
     return walls
+
+
+def snap_wall_thickness(
+    measured_cm: float,
+    default_cm: float,
+    standards_in: Sequence[float] = STANDARD_WALL_THICKNESSES_IN,
+    tolerance_in: float = THICKNESS_SNAP_TOLERANCE_IN,
+) -> Tuple[float, str]:
+    """Snap a measured thickness to the nearest standard wall width.
+
+    Returns (thickness_cm, label). The label is the standard chosen, e.g.
+    "6in", or "fallback-default" when the measurement is farther than the
+    tolerance from every standard, which normally means the parallel pair
+    was not really two faces of one wall.
+    """
+    if not standards_in:
+        return default_cm, "fallback-default"
+    nearest = min(standards_in, key=lambda inches: abs(inches * CM_PER_INCH - measured_cm))
+    if abs(nearest * CM_PER_INCH - measured_cm) <= tolerance_in * CM_PER_INCH:
+        return nearest * CM_PER_INCH, _inch_label(nearest)
+    return default_cm, "fallback-default"
+
+
+def _inch_label(inches: float) -> str:
+    return f"{inches:g}in"
+
+
+def _walls_from_pixel_segments(
+    segs: Sequence[Seg],
+    image_height: int,
+    cm_per_pixel: float,
+    default_thickness_cm: float,
+    log: Optional[LogFn],
+) -> Tuple[List[Wall], Dict[str, int]]:
+    """Convert pixel segments to Unreal-cm walls with standards-snapped thickness.
+
+    Also returns how many walls received each thickness label so detection
+    quality can be judged from the console.
+    """
+    walls: List[Wall] = []
+    distribution: Dict[str, int] = defaultdict(int)
+    fallbacks = 0
+    for x1, y1, x2, y2, thickness_px in segs:
+        # Image Y grows downward; Unreal XY uses Y up on the floor plane.
+        start = (x1 * cm_per_pixel, (image_height - y1) * cm_per_pixel)
+        end = (x2 * cm_per_pixel, (image_height - y2) * cm_per_pixel)
+
+        if thickness_px <= 0.0:
+            # No parallel partner was found, so nothing was measured.
+            thickness, label = default_thickness_cm, "unpaired-default"
+        else:
+            corrected_px = max(thickness_px - EDGE_PAIR_BIAS_PX, 1.0)
+            measured_cm = corrected_px * cm_per_pixel
+            thickness, label = snap_wall_thickness(measured_cm, default_thickness_cm)
+            if label == "fallback-default":
+                fallbacks += 1
+                if fallbacks <= MAX_THICKNESS_WARNINGS:
+                    _log(
+                        f"WARNING: measured wall thickness {measured_cm:.1f} cm "
+                        f"({measured_cm / CM_PER_INCH:.1f} in) matches no standard width "
+                        f"(likely a false pairing); using default {default_thickness_cm:.1f} cm.",
+                        log,
+                    )
+        distribution[label] += 1
+        walls.append(_seg(start, end, thickness))
+
+    if fallbacks > MAX_THICKNESS_WARNINGS:
+        _log(
+            f"WARNING: {fallbacks - MAX_THICKNESS_WARNINGS} more wall(s) fell back to the default thickness.",
+            log,
+        )
+    return walls, distribution
+
+
+def _log_thickness_distribution(distribution: Dict[str, int], log: Optional[LogFn]) -> None:
+    if not distribution:
+        return
+
+    def order(label: str) -> Tuple[int, float]:
+        if label.endswith("in"):
+            return (0, float(label[:-2]))
+        return (1, 0.0) if label == "unpaired-default" else (2, 0.0)
+
+    parts = ", ".join(f"{label}: {distribution[label]} wall(s)" for label in sorted(distribution, key=order))
+    _log(f"   Thickness distribution: {parts}", log)
 
 
 def _snap_axis_aligned(lines: Sequence[Sequence[float]]) -> List[Line]:

@@ -172,6 +172,28 @@ bool AWallGeneratorActor::RebuildMesh()
 	return true;
 }
 
+int32 AWallGeneratorActor::AddWallSegment(const FWallSegment& Segment)
+{
+	Modify();
+	const int32 NewIndex = WallSegments.Add(Segment);
+	RebuildMesh();
+	return NewIndex;
+}
+
+bool AWallGeneratorActor::RemoveWallSegmentAt(const int32 Index)
+{
+	if (!WallSegments.IsValidIndex(Index))
+	{
+		UE_LOG(LogFloor2Dto3Dplan, Warning, TEXT("RemoveWallSegmentAt: index %d is out of range (%d walls)."), Index, WallSegments.Num());
+		return false;
+	}
+
+	Modify();
+	WallSegments.RemoveAt(Index);
+	RebuildMesh();
+	return true;
+}
+
 void AWallGeneratorActor::GenerateCollision()
 {
 	if (DynamicMeshComponent)
